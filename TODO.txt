@@ -1,0 +1,17 @@
+- implement loading masks for extra datasets --------------- DONE
+- data augmentation:
+	- pitch shifts ------------------------------------- NOT STARTED
+	- tempo manipulation ------------------------------- NOT STARTED
+	- masking? ----------------------------------------- NOT STARTED
+- tempo labels:
+	- turn into classification ------------------------- NOT STARTED
+	- reformat label ----------------------------------- NOT STARTED
+	- reformat prediction at inference ----------------- NOT STARTED
+- DBN ------------------------------------------------------ NOT STARTED
+
+- experiments to run:
+	- partial transformers with TCN?
+	- partial transformers with transformer blocks --> beat_this with beats, onsets and tempo
+
+- maybe:
+	- stitched predictions for local and challenge test set? (maybe not necessary)
