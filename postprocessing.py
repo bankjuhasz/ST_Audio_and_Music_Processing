@@ -5,6 +5,36 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+def postp_tempo(pred_logits: torch.Tensor, neighborhood: float=0.2):
+    """ Turning tempo logits into probabilities, then extracting two tempo predictions --> for a single piece """
+    probs_tm = F.softmax(pred_logits, dim=0)
+    top1_idx = torch.argmax(probs_tm).item()
+    b1 = top1_idx + 1  # from idx to bpm
+
+    # a bit of trickery: I'm allowed to submit two estimates, but +-8% is still considered correct. therefore, I calculate
+    # a neighborhood around my best guess and take the second best guess OUTSIDE of that neighborhood, as two very close
+    # predictions cancel each other out.
+    low_cut = b1 * (1.0 - neighborhood)
+    min_bin = int(torch.floor(torch.tensor(low_cut)).item())
+    high_cut = b1 * (1.0 + neighborhood)
+    max_bin = int(torch.ceil(torch.tensor(high_cut)).item())
+    min_bin = max(1, min(300, min_bin)) # clamp to [1,300]
+    max_bin = max(1, min(300, max_bin))
+    min_idx = min_bin - 1  # from bpm to idx
+    max_idx = max_bin - 1
+    mask = torch.ones_like(probs_tm, dtype=torch.bool)  # [300,]
+    mask[min_idx: max_idx + 1] = False
+
+    masked_scores = probs_tm.clone()
+    masked_scores[~mask] = -1e9 # for values inside the neighborhood, set to very low value
+    second_idx = torch.argmax(masked_scores).item()
+    b2 = second_idx + 1
+
+    # sort to conform to the submission requirements
+    b2, b1 = min(b1, b2), max(b1, b2)
+
+    return np.array([b2, b1]) # mir_eval expects np.ndarray
+
 
 def postp_minimal(pred_logits, padding_mask=None, tolerance=70, inference=False, raw=False):
     tolerance = int(tolerance / 10)

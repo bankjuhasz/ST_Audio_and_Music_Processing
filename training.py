@@ -22,9 +22,9 @@ LR            = 1e-3
 NUM_EPOCHS    = 1000
 PATIENCE      = 20
 DEVICE        = 'cuda' if torch.cuda.is_available() else 'cpu'
-SEND_TO_WANDB = True
+SEND_TO_WANDB = False
 CHECKPOINT_PATH = Path(CHECKPOINT_PATH)
-CHECKPOINT_NAME_STEM = '09_beats_onsets_balanced-loss_plscheduled_beat-focus_e{epoch}_frs_tcn.pt'
+CHECKPOINT_NAME_STEM = '10_beats_onsets_balanced-loss_plscheduled_beat-focus_e{epoch}_frs_tcn.pt'
 SEED = 0
 
 random.seed(SEED)
@@ -113,7 +113,7 @@ epochs_no_improve = 0
 best_epoch = None
 best_model_state = None
 
-# if you've ever wondered how to train a dragon, here it is:
+# how to train a dragon:
 for epoch in range(1, NUM_EPOCHS+1):
 
     ### Training ###
@@ -122,7 +122,7 @@ for epoch in range(1, NUM_EPOCHS+1):
     train_loss = 0.0
     train_beat_f1s = 0.0
     train_onset_f1s = 0.0
-    train_tempo_maes = 0.0
+    train_tempo_ps = 0.0
 
     for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}"):
         feats = batch['features'].to(DEVICE)
@@ -164,49 +164,49 @@ for epoch in range(1, NUM_EPOCHS+1):
                     show_spectrogram(spect[i])
             break
 
-        train_beat_f1, train_onset_f1, train_tempo_mae = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_mae']
+        train_beat_f1, train_onset_f1, train_tempo_p = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_p']
 
         optimizer.step()
         train_loss += loss.item() * feats.size(0)
         train_beat_f1s += train_beat_f1 * feats.size(0)
         train_onset_f1s += train_onset_f1 * feats.size(0)
-        train_tempo_maes += train_tempo_mae * feats.size(0)
+        train_tempo_ps += train_tempo_p * feats.size(0)
 
     train_loss /= len(train_ds)
     train_beat_f1s /= len(train_ds)
     train_onset_f1s /= len(train_ds)
-    train_tempo_maes /= len(train_ds)
+    train_tempo_ps /= len(train_ds)
 
     ### Validation ###
     model.eval()
     val_loss = 0.0
     val_beat_f1s = 0.0
     val_onset_f1s = 0.0
-    val_tempo_maes = 0.0
+    val_tempo_ps = 0.0
     with torch.no_grad():
         for batch in val_loader:
             feats = batch['features'].to(DEVICE)
             outs = model(feats)
             loss, metrics = compute_loss(model, outs, batch, epoch, stage='val')
-            val_beat_f1, val_onset_f1, val_tempo_mae = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_mae']
+            val_beat_f1, val_onset_f1, val_tempo_p = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_p']
 
             val_loss += loss.item() * feats.size(0)
             val_beat_f1s += val_beat_f1 * feats.size(0)
             val_onset_f1s += val_onset_f1 * feats.size(0)
-            val_tempo_maes += val_tempo_mae * feats.size(0)
+            val_tempo_ps += val_tempo_p * feats.size(0)
 
     val_loss /= len(val_ds)
     val_beat_f1s /= len(val_ds)
     val_onset_f1s /= len(val_ds)
-    val_tempo_maes /= len(val_ds)
+    val_tempo_ps /= len(val_ds)
     scheduler.step(val_beat_f1s)  # use onset F1 for scheduler
     if epoch >= 20:
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"LR stepped -- current LR={current_lr:.5f}")
 
     print(f"Epoch {epoch}/{NUM_EPOCHS}")
-    print(f"Train Loss: {train_loss:.4f} — Train Beat F1: {train_beat_f1s:.4f} — Train Onset F1: {train_onset_f1s:.4f} — Train Tempo MAE: {train_tempo_maes:.4f}")
-    print(f"Val Loss: {val_loss:.4f} — Val Beat F1: {val_beat_f1s:.4f} — Val Onset F1: {val_onset_f1s:.4f} — Val Tempo MAE: {val_tempo_maes:.4f}")
+    print(f"Train Loss: {train_loss:.4f} — Train Beat F1: {train_beat_f1s:.4f} — Train Onset F1: {train_onset_f1s:.4f} — Train Tempo P: {train_tempo_ps:.4f}")
+    print(f"Val Loss: {val_loss:.4f} — Val Beat F1: {val_beat_f1s:.4f} — Val Onset F1: {val_onset_f1s:.4f} — Val Tempo P: {val_tempo_ps:.4f}")
 
     if SEND_TO_WANDB:
         wandb.log({
@@ -215,19 +215,19 @@ for epoch in range(1, NUM_EPOCHS+1):
             "val_loss": val_loss,
             "train_beat_f1": train_beat_f1s,
             "train_onset_f1": train_onset_f1s,
-            "train_tempo_mae": train_tempo_maes,
+            "train_tempo_mae": train_tempo_ps,
             "val_beat_f1": val_beat_f1s,
             "val_onset_f1": val_onset_f1s,
-            "val_tempo_mae": val_tempo_maes,
+            "val_tempo_mae": val_tempo_ps,
             "learning_rate": optimizer.param_groups[0]["lr"],
         })
 
     # Early stopping logic
     if epoch >= 20:
-         #if val_loss < best_val_loss:
-        if val_beat_f1s > best_beat_f1:
-            #best_val_loss = val_loss
-            best_beat_f1 = val_beat_f1s
+        if val_loss < best_val_loss:
+        #if val_beat_f1s > best_beat_f1:
+            best_val_loss = val_loss
+            #best_beat_f1 = val_beat_f1s
             epochs_no_improve = 0
             best_epoch = epoch
             best_ckpt_path = CHECKPOINT_PATH / CHECKPOINT_NAME_STEM.format(epoch=epoch)
@@ -256,29 +256,29 @@ for epoch in range(1, NUM_EPOCHS+1):
             test_loss = 0.0
             test_beat_f1s = 0.0
             test_onset_f1s = 0.0
-            test_tempo_maes = 0.0
+            test_tempo_ps = 0.0
             with torch.no_grad():
                 for batch in test_loader:
                     feats = batch['features'].to(DEVICE)
                     outs = model(feats)
                     loss, metrics = compute_loss(model, outs, batch, epoch, stage='test')
-                    test_beat_f1, test_onset_f1, test_tempo_mae = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_mae']
+                    test_beat_f1, test_onset_f1, test_tempo_p = metrics['beat_f1'], metrics['onset_f1'], metrics['tempo_p']
                     test_loss += loss.item() * feats.size(0)
                     test_beat_f1s += test_beat_f1 * feats.size(0)
                     test_onset_f1s += test_onset_f1 * feats.size(0)
-                    test_tempo_maes += test_tempo_mae * feats.size(0)
+                    test_tempo_ps += test_tempo_p * feats.size(0)
             test_loss /= len(test_ds)
             test_beat_f1s /= len(test_ds)
             test_onset_f1s /= len(test_ds)
-            test_tempo_maes /= len(test_ds)
+            test_tempo_ps /= len(test_ds)
             print(
-                f"Test Loss: {test_loss:.4f} — Test Beat F1: {test_beat_f1s:.4f} — Test Onset F1: {test_onset_f1s:.4f} — Test Tempo MAE: {test_tempo_maes:.4f}")
+                f"Test Loss: {test_loss:.4f} — Test Beat F1: {test_beat_f1s:.4f} — Test Onset F1: {test_onset_f1s:.4f} — Test Tempo P: {test_tempo_ps:.4f}")
             if SEND_TO_WANDB:
                 wandb.log({
                     "test_loss": test_loss,
                     "test_beat_f1": test_beat_f1s,
                     "test_onset_f1": test_onset_f1s,
-                    "test_tempo_mae": test_tempo_maes,
+                    "test_tempo_p": test_tempo_ps,
                     "epoch": epoch,
                 })
             break

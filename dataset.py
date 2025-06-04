@@ -63,7 +63,7 @@ class DragonDataset(Dataset):
         frame_times = np.arange(0, T * self.frame_length, self.frame_length)
 
         # load onset, beat and tempo annotations
-        onsets, beats, tempo_label = self.load_annotations(stem, directory)
+        onsets, beats, tempo_truth_label = self.load_annotations(stem, directory)
 
         ### BEATS AND ONSETS ###
 
@@ -151,21 +151,18 @@ class DragonDataset(Dataset):
 
 
         ### TEMPO ###
-        if tempo_label is None:
-            # no tempo label, set to zero
-            tempo_label = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            tempo_mask = np.zeros(shape=(3,), dtype=np.float32)
-        else:
-            tempo_mask = np.ones(shape=(3,), dtype=np.float32)
-
+        tempo_label, tempo_mask = self.make_tempo_label(tempo_truth_label, max_bpm=300)  # [300,]
+        if tempo_truth_label is None:
+            tempo_truth_label = np.array([])
 
         return {
             "features": feats,  # [C, F, T]
             "onset_label": torch.from_numpy(onset_label),  # [T]
             "beat_label": torch.from_numpy(beat_label),  # [T]
-            "tempo_label": torch.from_numpy(tempo_label), # float
+            "tempo_label": torch.from_numpy(tempo_label), # [300]
             "onset_truth_times": torch.from_numpy(onset_truth_times),
             "beat_truth_times": torch.from_numpy(beat_truth_times),
+            "tempo_truth_label": torch.from_numpy(tempo_truth_label),  # [3] or None
             "onset_weight": torch.from_numpy(onset_weight),  # [T]
             "beat_weight": torch.from_numpy(beat_weight),  # [T]
             "beat_mask": torch.from_numpy(beat_mask),  # [T]
@@ -173,6 +170,41 @@ class DragonDataset(Dataset):
             "tempo_mask": torch.from_numpy(tempo_mask),  # [T]
             "audio_name": stem,  # for debugging
         }
+
+    @staticmethod
+    def make_tempo_label(tempo: np.ndarray, max_bpm: int = 300) -> np.ndarray:
+        """Convert (low, high, proportion) label to 300 dimensional probability vector."""
+        if tempo is None or len(tempo) != 3:
+            # no tempo label --> return zero mask and zero label vector
+            tempo_mask = np.zeros(max_bpm, dtype=np.float32)
+            tempo_label = np.zeros(max_bpm, dtype=np.float32)
+            return tempo_label, tempo_mask
+
+        low, high, prop = tempo[0], tempo[1], tempo[2]
+
+        low_bin = int(np.round(low))
+        high_bin = int(np.round(high))
+        low_bin = max(1, min(max_bpm, low_bin)) # just for safety
+        high_bin = max(1, min(max_bpm, high_bin)) # just for safety
+
+        low_idx = low_bin - 1  # zero-based index
+        high_idx = high_bin - 1
+
+        # building the label vector
+        tempo_label = np.zeros(max_bpm, dtype=np.float32)
+        if low_idx == high_idx:
+            # only one tempo, all annotators agree
+            tempo_label[low_idx] = 1.0
+        else:
+            # two tempi and a proportion
+            tempo_label[low_idx] = prop
+            tempo_label[high_idx] = 1-prop
+
+        # building the mask for the loss fn --> tempo label is present --> all ones
+        tempo_mask = np.ones(max_bpm, dtype=np.float32)
+
+        return tempo_label, tempo_mask # both [300,]
+
 
     def load_annotations(self, stem: str, directory: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -258,31 +290,33 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     feats = torch.zeros((B, C, F, T_max), dtype=torch.float32)
     onsets = torch.zeros((B, T_max), dtype=torch.float32)
     beats = torch.zeros((B, T_max), dtype=torch.float32)
-    tempos = torch.zeros((B, 3), dtype=torch.float32)
+    tempi = torch.zeros((B, 300), dtype=torch.float32)
     masks = torch.zeros((B, T_max), dtype=torch.bool)  # for padding
     onset_weight = torch.zeros((B, T_max), dtype=torch.float32)
     beat_weight = torch.zeros((B, T_max), dtype=torch.float32)
     beat_mask = torch.zeros((B, T_max), dtype=torch.float32)
     onset_mask = torch.zeros((B, T_max), dtype=torch.float32)
-    tempo_mask = torch.zeros((B, 3), dtype=torch.float32)
+    tempo_mask = torch.zeros((B, 300), dtype=torch.float32)
 
     onsets_truth_times = []
     beats_truth_times = []
+    tempo_truth_label = []
     audio_names = []
     for i, s in enumerate(batch):
         t = s["features"].shape[-1]
         feats[i, :, :, :t] = s["features"]
         onsets[i, :t] = s["onset_label"]
         beats[i, :t] = s["beat_label"]
-        tempos[i] = s["tempo_label"]
+        tempi[i, :300] = s["tempo_label"] # assuming max_bpm is 300
         masks[i, :t] = True
         onset_weight[i, :t] = s["onset_weight"]
         beat_weight[i, :t] = s["beat_weight"]
         onsets_truth_times.append(s["onset_truth_times"])
         beats_truth_times.append(s["beat_truth_times"])
+        tempo_truth_label.append(s["tempo_truth_label"])
         beat_mask[i, :t] = s["beat_mask"]
         onset_mask[i, :t] = s["onset_mask"]
-        tempo_mask[i] = s["tempo_mask"]
+        tempo_mask[i, :300] = s["tempo_mask"] # assuming max_bpm is 300
         audio_names.append(s["audio_name"])
 
     ### DEBUGGING ###
@@ -299,14 +333,15 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "features": feats, # [B, C, F, T_max]
         "beat_label": beats,  # [B, T_max]
         "onset_label": onsets, # [B, T_max]
-        "tempo_label": tempos, # [B, 3]
+        "tempo_label": tempi, # [B, 300]
         "beat_truth_times": beats_truth_times,
         "onset_truth_times": onsets_truth_times,
+        "tempo_truth_label": tempo_truth_label,
         "beat_weight": beat_weight,  # [B, T_max]
         "onset_weight": onset_weight, # [B, T_max]
         "beat_mask": beat_mask,  # [B, T_max]
         "onset_mask": onset_mask,  # [B, T_max]
-        "tempo_mask": tempo_mask,  # [B, 3]
+        "tempo_mask": tempo_mask,  # [B, 300]
         "padding_mask": masks,  # [B, T_max]
         "audio_name": audio_names,  # [B]
     }

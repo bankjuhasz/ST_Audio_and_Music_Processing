@@ -1,7 +1,7 @@
 from constants import *
 import torch
 import torch.nn.functional as F
-from postprocessing import postp_minimal
+from postprocessing import postp_minimal, postp_tempo
 import numpy as np
 import mir_eval
 
@@ -24,6 +24,7 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     weight_be = batch['beat_weight'].to(DEVICE)
     beat_truth_times = batch['beat_truth_times']
     onset_truth_times = batch['onset_truth_times']
+    tempo_truth_times = batch['tempo_truth_label']
     beat_mask = batch['beat_mask'].to(DEVICE)
     onset_mask = batch['onset_mask'].to(DEVICE)
     tempo_mask = batch['tempo_mask'].to(DEVICE)
@@ -33,24 +34,12 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     pred_be = outputs['beat'].squeeze(-1)
     pred_tm = outputs['tempo'].squeeze(-1)
 
-    '''
-    # previous version --> non-fixed sized examples
-    #loss_on = F.binary_cross_entropy(pred_on, y_on, weight=weight_on, reduction='none')
-    #loss_be = F.binary_cross_entropy(pred_be, y_be, weight=weight_be, reduction='none')
-    # zero out padded frames
-    #loss_on = loss_on * padding_mask  # broadcasting [B,T] * [B,T]
-    #loss_be = loss_be * padding_mask
-    # avg over real frames
-    #loss_on = loss_on.sum(dim=1) / padding_mask.sum(dim=1).clamp(min=1)
-    #loss_be = loss_be.sum(dim=1) / padding_mask.sum(dim=1).clamp(min=1)
-    '''
-
     ### BEATS AND ONSETS ###
 
     # shift-tolerant BCE loss from beat_this
-    criterion = ShiftTolerantBCELoss(pos_weight=50)
-    loss_be = criterion(pred_be, y_be, padding_mask)
-    loss_on = criterion(pred_on, y_on, padding_mask)
+    criterion_be_on = ShiftTolerantBCELoss(pos_weight=50)
+    loss_be = criterion_be_on(pred_be, y_be, padding_mask)
+    loss_on = criterion_be_on(pred_on, y_on, padding_mask)
     # the (non-reduced) tensor returned by the STBCELoss has shorter sequence lengths than T, so the original masks
     # are not directly compatible. But the masks can be shortened, as they have a fixed value for each a specific row.
     beat_mask = beat_mask[:, :loss_be.shape[1]]
@@ -59,7 +48,20 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     loss_be = loss_be * beat_mask
     loss_on = loss_on * onset_mask
 
-    # calculating f1 scores for beats and onsets
+    ### TEMPO ###
+    log_probs_tm = F.log_softmax(pred_tm, dim=1)
+    loss_tm = F.kl_div(log_probs_tm, y_tm, reduction="none")
+    loss_tm = loss_tm * tempo_mask
+
+    postp_tm = np.zeros((pred_tm.shape[0], 2), dtype=np.float32)  # [B, 2] for two tempi in bpm
+    for i in range(loss_tm.shape[0]):
+        if tempo_mask[i].sum() == 0:
+            continue
+        else:
+            postp_tm[i, 0], postp_tm[i, 1] = postp_tempo(pred_tm[i], neighborhood=0.2)  # postprocess to get two tempo predictions in bpm
+
+    ### METRICS ###
+
     if epoch % metrics_every_n_epoch == 0:
         # beats
         postp_be = postp_minimal(pred_be, padding_mask, tolerance=199) # postprocess to get beat predictions in seconds
@@ -81,17 +83,21 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
             onset_f1.append(f1)
         onset_f1 = np.mean(onset_f1) if onset_f1 else 0.0
 
-        # tempo TODO
-        '''pred_tm = outs['tempo'].detach().cpu().numpy()
-        gt_tm = batch['tempo_label'].cpu().numpy()
-        for pred, gt in zip(pred_tm, gt_tm):
-            if gt.any() > 0:
-                tempo_accs.append(mir_eval.tempo.detection(gt[:2], gt[2], np.clip(pred[:2], 0, None), tol=0.08))'''
+        # tempo
+        tempo_p = []
+        for ref_tempi, est_tempi in zip(tempo_truth_times, postp_tm):
+            if len(ref_tempi) == 0: # no annotation
+                continue
+            ref_tempi_np = ref_tempi[:2].detach().cpu().numpy()
+            ref_weight = ref_tempi[2].detach().item()
+            scores = mir_eval.tempo.detection(ref_tempi_np, ref_weight, est_tempi, tol=0.08)
+            tempo_p.append(scores[0])
+        tempo_p = np.mean(tempo_p) if tempo_p else 0.0
 
         metrics = {
             'beat_f1': beat_f1,
             'onset_f1': onset_f1,
-            'tempo_mae': 0.0,  # TODO
+            'tempo_p': tempo_p,
         }
 
     # tempo loss
@@ -121,22 +127,25 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     # turn raw_log_var → positive log_var
     log_var_on = F.softplus(model.raw_log_var_on)
     log_var_be = F.softplus(model.raw_log_var_be)
-    #log_var_tm = F.softplus(model.raw_log_var_tm)
+    log_var_tm = F.softplus(model.raw_log_var_tm)
 
     # convert log‐vars --> precision
     precision_on = torch.exp(-log_var_on)
     precision_be = torch.exp(-log_var_be)
-    #precision_tm = torch.exp(-log_var_tm)
+    precision_tm = torch.exp(-log_var_tm)
 
-    weighted_summed_loss = (#loss_be + loss_on
-        precision_on * loss_on + log_var_on +
-        precision_be * loss_be + log_var_be
-        #precision_tm * loss_tm + log_var_tm
+    loss_be = loss_be.mean(dim=1) # mean over T
+    loss_on = loss_on.mean(dim=1) # mean over T
+    loss_tm = loss_tm.mean(dim=1) # mean over BPM dim
+
+    weighted_summed_loss = (  # loss_be + loss_on
+            precision_on * loss_on + log_var_on +
+            precision_be * loss_be + log_var_be +
+            precision_tm * loss_tm + log_var_tm
     )
-    #weighted_summed_loss = 3*loss_on + loss_be
 
     return weighted_summed_loss.mean(), metrics
-
+    #return loss_tm.mean(), metrics
 
 
 class ShiftTolerantBCELoss(torch.nn.Module):

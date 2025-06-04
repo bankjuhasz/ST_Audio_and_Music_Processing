@@ -2,3 +2,5 @@ data/
 checkpoints/
 predictions/
 wandb/
+report.docx
+report.pdf

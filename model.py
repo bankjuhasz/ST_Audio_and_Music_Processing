@@ -52,11 +52,11 @@ class ThreeHeadedDragon(nn.Module):
 
 
         ### TCN BLOCKS ###
-        tcn_layers = []
-        for i, d in enumerate(range(0, 11)):
-            tcn_layers.append(TCNBlock(224, kernel_size=5, dilation=2 ** d, dropout=0.1))
-        self.tcn = nn.Sequential(*tcn_layers)
-
+        #tcn_layers = []
+        #for i, d in enumerate(range(0, 11)):
+        #    tcn_layers.append(TCNBlock(224, kernel_size=5, dilation=2 ** d, dropout=0.1))
+        #self.tcn = nn.Sequential(*tcn_layers)
+        self.tcn = TCNWithAccum([TCNBlock(224, kernel_size=5, dilation=2 ** d, dropout=0.1) for d in range(11)])
 
         ### POSITIONAL ENCODING FOR TRANSFORMER ###
         '''
@@ -104,7 +104,7 @@ class ThreeHeadedDragon(nn.Module):
         #B,C,F,T = x.shape  # B: batch size, C: channels, F: frequency bins, T: time frames
         #x = x.view(B, C * F, T)
         #print(f"Shape before tcn: {x.shape}")
-        x = self.tcn(x)
+        x, tempo_feat = self.tcn(x)
         #print(f"Shape after tcn: {x.shape}")
         #x = self.rearrange_for_transformer(x)  # [B, T, C*F]
         #print(f"Shape after rearrange: {x.shape}")
@@ -115,7 +115,7 @@ class ThreeHeadedDragon(nn.Module):
         return {
             "onset": self.heads["onset"](x),
             "beat": self.heads["beat"](x),
-            "tempo": self.heads["tempo"](x)
+            "tempo": self.heads["tempo"](tempo_feat),
         }
 
     @staticmethod
@@ -180,8 +180,9 @@ class ThreeHeadedDragon(nn.Module):
             "tempo": nn.Sequential(
                 #Rearrange("b t d -> b d t"),
                 nn.AdaptiveAvgPool1d(1), # [B, C*F, T] → [B, C*F, 1]
-                nn.Flatten(1), # [B, C*F, 1] → [B, C*F]
-                nn.Linear(224, 3)
+                #nn.Flatten(1), # [B, C*F, 1] → [B, C*F]
+                Rearrange("b c 1 -> b c"),  # [B, C*F, 1] → [B, C*F]
+                nn.Linear(224, 300)
             )
         })
 
@@ -191,23 +192,19 @@ class ThreeHeadedDragon(nn.Module):
             self._acts[name] = out.detach()
         return hook
 
-    '''
-    "onset": nn.Sequential(
-        nn.Conv2d(channels, channels, 1), nn.ReLU(inplace=True),
-        nn.Conv2d(channels, 1, 1),
-        # average out frequency dimension, keep time dimension:
-        nn.AvgPool2d(kernel_size=(4, 1)),
-        Rearrange("b 1 1 t -> b t 1"),
-        #nn.Sigmoid(),
-    ),
-    "beat": nn.Sequential(
-        nn.Conv2d(channels, channels, 1), nn.ReLU(inplace=True),
-        nn.Conv2d(channels, 1, 1),
-        nn.AvgPool2d(kernel_size=(4, 1)),
-        Rearrange("b 1 1 t -> b t 1"),
-        #nn.Sigmoid(),
-    ),
-    '''
+
+class TCNWithAccum(nn.Module):
+    """ TCN which is able to accumulate intermediate outputs and return them. """
+    def __init__(self, tcn_blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(tcn_blocks)
+
+    def forward(self, x):
+        accum = 0
+        for block in self.blocks:
+            y, x = block(x, return_y=True)
+            accum = accum + y
+        return x, accum
 
 class TCNBlock(nn.Module):
     def __init__(self, channels, kernel_size, dilation, dropout=0.1, padding=None):
@@ -223,14 +220,15 @@ class TCNBlock(nn.Module):
         # residual connection
         self.res_conv = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, return_y=False):
         y = self.conv2(self.drop(self.elu(self.conv(x))))
-        #y = self.conv2(self.elu(self.conv(x)))
         r = self.res_conv(x)
+        out = r + y # residual connection
+        if return_y:
+            return y, out # return both the output and the intermediate y for accumulation for tempo predictions
+        # if not returning y, just return the output --> original TCN behavior
+        return out
 
-        # residual connection
-        #print(f"Input shape: {x.shape}, Conv output shape: {y.shape}, Residual shape: {r.shape}")
-        return r + y
 
 class FrontEndStomach(nn.Module):
     """

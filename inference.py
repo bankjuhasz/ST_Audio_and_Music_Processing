@@ -1,10 +1,11 @@
 import torch
 from pathlib import Path
 import json
+from tqdm import tqdm
 
 from constants import *
 from model import ThreeHeadedDragon
-from postprocessing import postp_minimal
+from postprocessing import postp_minimal, postp_tempo
 
 def predict_single_example(checkpoint_path: str, spect_path: str, device: str = 'cpu', target: str = 'beat') -> dict:
     model = load_model(checkpoint_path, device)
@@ -19,7 +20,7 @@ def make_predictions(checkpoint_path, device: str = 'cpu'):
     test_set = load_test_spectrograms()  # returns a list of tensors
 
     predictions = {}
-    for item in test_set:
+    for item in tqdm(test_set, desc="Predicting"):
         stem = item['stem']
         spect = item['spectrogram'].to(device)
         with torch.no_grad():
@@ -27,13 +28,13 @@ def make_predictions(checkpoint_path, device: str = 'cpu'):
             output = model(spect)
 
         # postprocess each head output
-        pred_beats = output['beat'].squeeze(-1)
-        pred_onsets = output['onset'].squeeze(-1)
-
+        pred_beats = output['beat'].squeeze(-1) # remove channel dim
+        pred_onsets = output['onset'].squeeze(-1) # remove channel dim
+        pred_tempi = output['tempo'].squeeze(0) # remove batch dim
 
         onsets = postp_minimal(pred_logits=pred_onsets, tolerance=50, inference=True)
         beats = postp_minimal(pred_logits=pred_beats, tolerance=199, inference=True)
-        tempo = output['tempo'].cpu().numpy().tolist()
+        tempo = postp_tempo(pred_logits=pred_tempi, neighborhood=0.2).tolist()
 
         predictions[stem] = {
             "onsets": onsets,
@@ -66,7 +67,7 @@ def load_model(checkpoint_path: str, device: str, freq_dim=FREQ_DIM, stomach_dim
 
 if __name__ == '__main__':
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_name = '09_beats_onsets_balanced-loss_plscheduled_beat-focus_e71_frs_tcn.pt'
+    ckpt_name = '10_beats_onsets_tempi_balanced-loss_plscheduled_e76_frs_tcn.pt'
     ckpt_path = Path(CHECKPOINT_PATH) / ckpt_name
     predictions = make_predictions(ckpt_path)
     # save predictions to a json file
