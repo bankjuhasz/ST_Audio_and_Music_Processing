@@ -1,9 +1,10 @@
 from constants import *
 import torch
 import torch.nn.functional as F
-from postprocessing import postp_minimal, postp_tempo
+from postprocessing import postp_minimal, postp_tempo, madmom_onsets, madmom_dbn_beats
 import numpy as np
 import mir_eval
+import math
 
 
 # loss computation
@@ -20,8 +21,8 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     y_be = batch['beat_label'].to(DEVICE)
     y_tm = batch['tempo_label'].to(DEVICE)
     padding_mask = batch['padding_mask'].to(DEVICE)
-    weight_on = batch['onset_weight'].to(DEVICE)
-    weight_be = batch['beat_weight'].to(DEVICE)
+    #weight_on = batch['onset_weight'].to(DEVICE)
+    #weight_be = batch['beat_weight'].to(DEVICE)
     beat_truth_times = batch['beat_truth_times']
     onset_truth_times = batch['onset_truth_times']
     tempo_truth_times = batch['tempo_truth_label']
@@ -37,11 +38,12 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     ### BEATS AND ONSETS ###
 
     # shift-tolerant BCE loss from beat_this
-    criterion_be_on = ShiftTolerantBCELoss(pos_weight=50)
-    loss_be = criterion_be_on(pred_be, y_be, padding_mask)
-    loss_on = criterion_be_on(pred_on, y_on, padding_mask)
+    criterion_be = ShiftTolerantBCELoss(pos_weight=50)
+    loss_be = criterion_be(pred_be, y_be, padding_mask)
+    criterion_on = ShiftTolerantBCELoss(pos_weight=20, tolerance=1)
+    loss_on = criterion_on(pred_on, y_on, padding_mask)
     # the (non-reduced) tensor returned by the STBCELoss has shorter sequence lengths than T, so the original masks
-    # are not directly compatible. But the masks can be shortened, as they have a fixed value for each a specific row.
+    # are not directly compatible. But the masks can be shortened, as they have a fixed value for each row.
     beat_mask = beat_mask[:, :loss_be.shape[1]]
     onset_mask = onset_mask[:, :loss_on.shape[1]]
     # apply the beat and onset masks --> zero out losses for examples without annotations
@@ -74,7 +76,9 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
         beat_f1 = np.mean(beat_f1) if beat_f1 else 0.0
 
         # onsets
-        postp_on = postp_minimal(pred_on, padding_mask, tolerance=50)  # postprocess to get onset predictions in seconds
+        #postp_on = postp_minimal(pred_on, padding_mask, tolerance=50)  # postprocess to get onset predictions in seconds
+        onset_activations = torch.sigmoid(pred_on.squeeze(0)).detach().cpu().numpy()
+        postp_on = madmom_onsets(onset_activations)
         onset_f1 = []
         for ref_onsets, est_onsets in zip(onset_truth_times, postp_on):
             if len(ref_onsets) == 0:
@@ -100,31 +104,13 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
             'tempo_p': tempo_p,
         }
 
-    # tempo loss
-    #max_bpm = 200.0
-    #pred_tm = outputs['tempo']  # [B, 3]
-    #y_tm_norm = y_tm[:, :2] / max_bpm  # [B, 2]
-    #pred_tm_norm = pred_tm[:, :2] / max_bpm  # [B, 2]
+    loss_be = loss_be.mean(dim=1)  # mean over T
+    loss_on = loss_on.mean(dim=1)  # mean over T
+    loss_tm = loss_tm.mean(dim=1)  # mean over BPM dim
 
-    # weight (we do not normalize)
-    #y_weight = y_tm[:, 2]  # [B]
-    #pred_weight = pred_tm[:, 2]  # [B]
-
-    # mse loss for tempi
-    #loss_tm = F.mse_loss(pred_tm_norm, y_tm_norm, reduction='none').mean(dim=1)  # [B]
-    # mse loss for weight (bce also possible)
-    #loss_weight = F.mse_loss(pred_weight, y_weight, reduction='none')  # [B]
-
-    # combine tempo and weight losses
-    #loss_tempo_total = loss_tm + loss_weight
-
-    '''
-    # masked sum
-    #total = m_o * loss_on + m_b * loss_be + m_t * loss_tm
-    # normalize per-example
-    #norm = (m_o + m_b + m_t).clamp(min=1e-8)
-    '''
-    # turn raw_log_var → positive log_var
+    """
+    # learning to juggle
+    # turn raw_log_var --> positive log_var
     log_var_on = F.softplus(model.raw_log_var_on)
     log_var_be = F.softplus(model.raw_log_var_be)
     log_var_tm = F.softplus(model.raw_log_var_tm)
@@ -134,18 +120,15 @@ def compute_loss(model, outputs, batch, epoch=0, stage='train'):
     precision_be = torch.exp(-log_var_be)
     precision_tm = torch.exp(-log_var_tm)
 
-    loss_be = loss_be.mean(dim=1) # mean over T
-    loss_on = loss_on.mean(dim=1) # mean over T
-    loss_tm = loss_tm.mean(dim=1) # mean over BPM dim
-
-    weighted_summed_loss = (  # loss_be + loss_on
+    weighted_summed_loss = (
             precision_on * loss_on + log_var_on +
             precision_be * loss_be + log_var_be +
             precision_tm * loss_tm + log_var_tm
-    )
+    )"""
+
+    weighted_summed_loss = loss_be + loss_on + loss_tm
 
     return weighted_summed_loss.mean(), metrics
-    #return loss_tm.mean(), metrics
 
 
 class ShiftTolerantBCELoss(torch.nn.Module):
@@ -205,3 +188,25 @@ class ShiftTolerantBCELoss(torch.nn.Module):
             reduction='none',
         )
 
+class OWBCE(torch.nn.Module):
+    """
+    Attempting to implement onset and offset weighted binary cross-entropy from https://arxiv.org/abs/2403.13254
+    I could not make it work in time --> would be interesting to try it without changing the architecture.
+    """
+    def __init__(self, w: int = 7, h: float = 12):
+        super().__init__()
+        self.w = w
+        self.h = h
+        t = torch.arange(-w, w+1, dtype=torch.float32)
+        win = h * torch.sin((t + w + 1) * math.pi / (2*(w+1)))
+        self.register_buffer("win", win.view(1,1,-1))
+
+    def forward(self, logits: torch.Tensor, y: torch.Tensor):
+        # (B,T) --> (B,1,T)
+        on_p = F.pad(y[:,1:] - y[:,:-1], (1,0))
+        off_p = F.pad(y[:,:-1] - y[:,1:], (0,1))
+        pulse = (on_p + off_p).clamp(min=0).unsqueeze(1)
+        win = self.win.to(pulse.device)
+        weights = 1 + F.conv1d(pulse, win, padding=self.w).squeeze(1)
+        bce = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
+        return weights * bce

@@ -14,7 +14,7 @@ from loss import compute_loss
 
 ### Hyperparameters ###
 BATCH_SIZE    = 64
-NUM_WORKERS   = 0
+NUM_WORKERS   = 8
 FREQ_DIM      = 128
 STOMACH_DIM   = 32
 CONV_OUT_CH   = 32
@@ -24,8 +24,8 @@ PATIENCE      = 20
 DEVICE        = 'cuda' if torch.cuda.is_available() else 'cpu'
 SEND_TO_WANDB = False
 CHECKPOINT_PATH = Path(CHECKPOINT_PATH)
-CHECKPOINT_NAME_STEM = '10_beats_onsets_balanced-loss_plscheduled_beat-focus_e{epoch}_frs_tcn.pt'
-SEED = 0
+CHECKPOINT_NAME_STEM = '16_BOT_no-val_e{epoch}_frs_tcn.pt'
+SEED = 42
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -50,22 +50,54 @@ if SEND_TO_WANDB:
     )
 
 ### Prepare dataset and loaders ###
-dataset = DragonDataset(
+full_dataset = DragonDataset(
     sample_rate=SAMPLE_RATE,
     hop_length=HOP_LENGTH,
+    excerpt_length=1000,
+    indices=None # None --> use all data --> this is a preliminary instantiation
 )
 # data split
-train_size = int(0.7 * len(dataset))
-val_size   = (len(dataset) - train_size) // 2
-test_size = (len(dataset) - train_size) - val_size
-print(f"Dataset size: {len(dataset)}")
+N = len(full_dataset)
+all_indices = np.arange(N)
+np.random.seed(SEED)
+np.random.shuffle(all_indices)
+
+train_size = int(0.7 * N)
+val_size   = int(0.15 * N)
+test_size  = N - train_size - val_size
+print(f"Dataset size: {N}")
 print(f"Train size: {train_size}, Val size: {val_size}, Test size: {test_size}")
 
-train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
+train_indices = all_indices[:train_size].tolist()
+val_indices   = all_indices[train_size : train_size + val_size].tolist()
+test_indices  = all_indices[train_size + val_size :].tolist()
 
-# DEBUG - Select the first batch (e.g., 16 samples)
-#fixed_indices = list(range(4))
-#fixed_subset = Subset(train_ds, fixed_indices)
+#train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
+
+# reinstantiate dataset with specific indices and augment flag
+train_ds = DragonDataset(
+    sample_rate=SAMPLE_RATE,
+    hop_length=HOP_LENGTH,
+    excerpt_length=1000,
+    indices=train_indices, # only train examples
+    augment=True # enable augmentation
+)
+
+val_ds = DragonDataset(
+    sample_rate=SAMPLE_RATE,
+    hop_length=HOP_LENGTH,
+    excerpt_length=1000,
+    indices=val_indices, # only val examples
+    augment=False # no augmentation
+)
+
+test_ds = DragonDataset(
+    sample_rate=SAMPLE_RATE,
+    hop_length=HOP_LENGTH,
+    excerpt_length=1000,
+    indices=test_indices, # only test examples
+    augment=False # no augmentation
+)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_fn)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
@@ -99,8 +131,22 @@ print(f"Total params:     {total_params:,}")
 print(f"Trainable params: {trainable_params:,}")
 
 #optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
-scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
+
+# continue from ckpt in case of crash
+resume_ckpt_path = CHECKPOINT_PATH / CHECKPOINT_NAME_STEM.format(epoch=67)
+start_epoch = 1
+
+if resume_ckpt_path is not None:
+    if resume_ckpt_path.exists():
+        checkpoint = torch.load(resume_ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from checkpoint at epoch {checkpoint['epoch']}")
+else:
+    print("No checkpoint found, starting from scratch.")
 
 
 #####################
@@ -114,7 +160,7 @@ best_epoch = None
 best_model_state = None
 
 # how to train a dragon:
-for epoch in range(1, NUM_EPOCHS+1):
+for epoch in range(start_epoch, NUM_EPOCHS+1):
 
     ### Training ###
 
@@ -215,10 +261,10 @@ for epoch in range(1, NUM_EPOCHS+1):
             "val_loss": val_loss,
             "train_beat_f1": train_beat_f1s,
             "train_onset_f1": train_onset_f1s,
-            "train_tempo_mae": train_tempo_ps,
+            "train_tempo_p": train_tempo_ps,
             "val_beat_f1": val_beat_f1s,
             "val_onset_f1": val_onset_f1s,
-            "val_tempo_mae": val_tempo_ps,
+            "val_tempo_p": val_tempo_ps,
             "learning_rate": optimizer.param_groups[0]["lr"],
         })
 

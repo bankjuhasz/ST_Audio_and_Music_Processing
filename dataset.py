@@ -6,6 +6,7 @@ import glob
 import numpy as np
 from typing import Dict, List
 from utils import show_spectrogram
+import random
 
 from constants import *
 
@@ -17,25 +18,28 @@ class DragonDataset(Dataset):
             train_dir_onsets: str = TRAIN_DATA_PATH_ONSETS,
             sample_rate: int = SAMPLE_RATE,
             hop_length: int = HOP_LENGTH,
-            excerpt_length: int = 1000 # in frames
+            excerpt_length: int = 1000, # in frames
+            indices: list[int] | None = None,  # if None, use all, if list, keep only those indices
+            augment: bool = False, # flag to enable data augmentation only in the training set
     ):
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.excerpt_length = excerpt_length
+        self.augment = augment
 
         self.train_dir_all = train_dir_all
         self.train_dir_tempobeats = train_dir_tempobeats
         self.train_dir_onsets = train_dir_onsets
 
-        # find all file stems by looking for .spect.pt
-        stem_paths_all = glob.glob(os.path.join(self.train_dir_all, "*.spect.pt"))
-        stem_paths_tempobeats = glob.glob(os.path.join(self.train_dir_tempobeats, "*.spect.pt"))
-        stem_paths_onsets = glob.glob(os.path.join(self.train_dir_onsets, "*.spect.pt"))
+        # find all file stems by looking for .orig.spect.pt
+        stem_paths_all = glob.glob(os.path.join(self.train_dir_all, "*.orig.spect.pt"))
+        stem_paths_tempobeats = glob.glob(os.path.join(self.train_dir_tempobeats, "*.orig.spect.pt"))
+        stem_paths_onsets = glob.glob(os.path.join(self.train_dir_onsets, "*.orig.spect.pt"))
 
-        # remove .spect.pt suffix
-        stem_paths_all = [os.path.basename(p)[:-len(".spect.pt")] for p in stem_paths_all]
-        stem_paths_tempobeats = [os.path.basename(p)[:-len(".spect.pt")] for p in stem_paths_tempobeats]
-        stem_paths_onsets = [os.path.basename(p)[:-len(".spect.pt")] for p in stem_paths_onsets]
+        # remove .orig.spect.pt suffix
+        stem_paths_all = [os.path.basename(p)[:-len(".orig.spect.pt")] for p in stem_paths_all]
+        stem_paths_tempobeats = [os.path.basename(p)[:-len(".orig.spect.pt")] for p in stem_paths_tempobeats]
+        stem_paths_onsets = [os.path.basename(p)[:-len(".orig.spect.pt")] for p in stem_paths_onsets]
 
         # mark the directories
         stem_paths_all = [(item, self.train_dir_all) for item in stem_paths_all]
@@ -43,8 +47,13 @@ class DragonDataset(Dataset):
         stem_paths_onsets = [(item, self.train_dir_onsets) for item in stem_paths_onsets]
 
         # combine all stems
-        # load_annotations will handle missing annotations
+        # load_annotations + __getitem__ will handle missing annotations
         self.stems = stem_paths_all + stem_paths_tempobeats + stem_paths_onsets
+
+        # this makes all the augmentation logic possible by allowing to differentiate between training, val, and test sets
+        if indices is not None:
+            self.stems = [self.stems[i] for i in indices]
+        self.augment_opts = ["orig", "str08", "str12", "pch+4", "pch-4"]
 
     def __len__(self):
         return len(self.stems)
@@ -52,9 +61,18 @@ class DragonDataset(Dataset):
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         stem, directory = self.stems[idx]
 
-        # load features
-        spect_path = os.path.join(directory, stem + ".spect.pt")
-        feats_original = torch.load(spect_path) # expect [C, F, T]
+        # determine whether to augment the data
+        if self.augment:
+            aug_choice = random.choice(self.augment_opts)
+        else:
+            aug_choice = "orig"
+        stem_spect = f"{stem}.{aug_choice}"  # add augmentation suffix to load correct spectrogram
+
+        # load the spectrogram with the augmentation suffix
+        spect_path = os.path.join(directory, stem_spect + ".spect.pt")
+        feats_original = torch.load(spect_path) # WARNING: 'original' is overloaded here -- it refers to the original format of the labels in this case, not that it has no augmentation
+        if aug_choice in ["str08", "str12"]:  # time stretching adds a batch dimension
+            feats_original = feats_original.squeeze(0)
         C, F, T = feats_original.shape
 
         # frame times (in seconds)
@@ -63,7 +81,13 @@ class DragonDataset(Dataset):
         frame_times = np.arange(0, T * self.frame_length, self.frame_length)
 
         # load onset, beat and tempo annotations
+        # these are the original annotations, changes for the chosen augmentation will be applied below
         onsets, beats, tempo_truth_label = self.load_annotations(stem, directory)
+
+        # only stretching affects the labels
+        if aug_choice in ["str08", "str12"]:
+            # stretch factor is 0.8 or 1.2, so we need to adjust the onsets accordingly
+            stretch_factor = 0.8 if aug_choice == "str08" else 1.2
 
         ### BEATS AND ONSETS ###
 
@@ -77,6 +101,9 @@ class DragonDataset(Dataset):
         if onsets is not None: # if onsets are present, otherwise the label will be all zeros
             # build frame-wise masks for missing annotations
             onset_mask = np.ones(shape=(T,), dtype=np.float32)
+            # apply time stretching to original onset annotations
+            if aug_choice in ["str08", "str12"]:
+                onsets = onsets / stretch_factor # really counterintuitive --> "stretch_factor of 2.0 will double the speed of the audio and halve the length of the audio"
             for t in onsets:
                 i = np.searchsorted(frame_times, t)
                 i -= 1
@@ -97,6 +124,9 @@ class DragonDataset(Dataset):
         if beats is not None: # if beats are present, otherwise the label will be all zeros
             # build frame-wise masks for missing annotations
             beat_mask = np.ones(shape=(T,), dtype=np.float32)
+            # apply time stretching to original beat annotations
+            if aug_choice in ["str08", "str12"]:
+                beats = beats / stretch_factor
             for t in beats:
                 i = np.searchsorted(frame_times, t)
                 i -= 1
@@ -113,7 +143,7 @@ class DragonDataset(Dataset):
         else:
             beat_mask = np.zeros(shape=(T,), dtype=np.float32)
 
-        # --- Random excerpt selection ---
+        ### RANDOM EXCERPT SELECTION ###
         if T > self.excerpt_length:
             start = np.random.randint(0, T - self.excerpt_length + 1)
             end = start + self.excerpt_length
@@ -151,6 +181,11 @@ class DragonDataset(Dataset):
 
 
         ### TEMPO ###
+        # apply time stretching to original tempo annotations if applicable
+        if aug_choice in ["str08", "str12"]:
+            if tempo_truth_label is not None:
+                tempo_truth_label[0] = tempo_truth_label[0] * stretch_factor # here we multiply --> "stretch_factor of 2.0 will double the speed of the audio"
+                tempo_truth_label[1] = tempo_truth_label[1] * stretch_factor
         tempo_label, tempo_mask = self.make_tempo_label(tempo_truth_label, max_bpm=300)  # [300,]
         if tempo_truth_label is None:
             tempo_truth_label = np.array([])
@@ -168,8 +203,9 @@ class DragonDataset(Dataset):
             "beat_mask": torch.from_numpy(beat_mask),  # [T]
             "onset_mask": torch.from_numpy(onset_mask),  # [T]
             "tempo_mask": torch.from_numpy(tempo_mask),  # [T]
-            "audio_name": stem,  # for debugging
+            "audio_name": stem_spect,  # for debugging, to keep track of what augmentation was applied
         }
+
 
     @staticmethod
     def make_tempo_label(tempo: np.ndarray, max_bpm: int = 300) -> np.ndarray:
@@ -207,16 +243,7 @@ class DragonDataset(Dataset):
 
 
     def load_annotations(self, stem: str, directory: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Load annotations for a given observation.
-        Based on the directory, it may return None if annotations are missing.
-        Args:
-            stem (str): stem of the target file
-            directory (str): directory where the annotations are stored
-        Returns:
-            tuple: (onsets, beats, tempo)
-        """
-
+        """ Load annotations for a given observation. """
         # onsets
         if directory == self.train_dir_all or directory == self.train_dir_onsets: # onset annotations present
             ext = ".onsets.gt"
@@ -345,5 +372,3 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "padding_mask": masks,  # [B, T_max]
         "audio_name": audio_names,  # [B]
     }
-
-    return batch

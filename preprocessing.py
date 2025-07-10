@@ -2,42 +2,55 @@ import numpy as np
 import torch
 import torchaudio
 from pathlib import Path
+from pedalboard import *
+
 from constants import *
 
-def main():
+def main(data_path=TRAIN_DATA_PATH_ONSETS):
     # main function to process all audio files in the training data directory.
 
-    for audio_file_path in Path(TEST_DATA_PATH).glob("*.wav"):
-        try:
-            print(f"Processing {audio_file_path.name}")
-            process_audio(audio_file_path, out_path=Path(PRED_DATA_PATH) / audio_file_path.name, mean=GLOBAL_MEAN, std=GLOBAL_STD)
-        except Exception as e:
-            print(f"Error processing {audio_file_path.name}: {e}")
+    variants = [ # for data augmentation
+        {"name": "orig", "stretch": 1.0, "shift": 0},
+        {"name": "str08", "stretch": 0.8, "shift": 0},
+        {"name": "str12", "stretch": 1.2, "shift": 0},
+        {"name": "pch+4", "stretch": 1.0, "shift": +4},
+        {"name": "pch-4", "stretch": 1.0, "shift": -4},
+    ]
+
+    for audio_file_path in Path(data_path).glob("*.wav"):
+        for v in variants:
+            try:
+                print(f"Processing {audio_file_path.name} --> {v['name']}")
+                process_audio(
+                    audio_file_path,
+                    data_path,
+                    mean=GLOBAL_MEAN, std=GLOBAL_STD,
+                    stretch=v["stretch"],
+                    shift=v["shift"],
+                    suffix=v["name"],
+                )
+            except Exception as e:
+                print(f"Error processing {audio_file_path.name} [{v['name']}]: {e}")
 
 
-def process_audio(audio_path, out_path, mean=GLOBAL_MEAN, std=GLOBAL_STD):
-    """
-    Load a single audio file, apply augmentations, create a spectrogram, and save it.
+def process_audio(audio_path, in_path, mean=GLOBAL_MEAN, std=GLOBAL_STD, stretch=1.0, shift=0, suffix="orig"):
+    """ Load a single audio file, apply augmentations, create a spectrogram, and save it. """
 
-    Args:
-        audio_path (str or Path): Path to the audio file.
-        out_path (str or Path): Path to save the spectrogram.
-    """
-    try:
-        # loading audio files
-        waveform, sample_rate = load_audio(audio_path)
-        # data augmentation
-        # TODO: Implement data augmentation
+    # loading audio files
+    waveform, sample_rate = load_audio(audio_path)
 
-        # create spectrogram
-        spectrogram = create_spectrogram(waveform, sample_rate, mean=mean, std=std)
+    # data augmentation
+    waveform = augment_waveform(waveform, sample_rate, stretch=stretch, shift=shift)
 
-        # save spectrogram
-        if spectrogram is not None:
-            out_path = Path(audio_path).with_suffix('.spect.pt')
-            save_spectrogram(spectrogram, out_path)
-    except Exception as e:
-        print(f"Error processing {audio_path}: {e}")
+    # create spectrogram
+    spectrogram = create_spectrogram(waveform, sample_rate, mean=mean, std=std)
+
+    # save spectrogram
+    if spectrogram is not None:
+        base = Path(audio_path).stem
+        out_name = f"{base}.{suffix}.spect.pt"
+        out_path = Path(in_path) / out_name
+        save_spectrogram(spectrogram, out_path)
 
 
 def load_audio(path, dtype="float64", target_sample_rate=SAMPLE_RATE):
@@ -53,22 +66,24 @@ def load_audio(path, dtype="float64", target_sample_rate=SAMPLE_RATE):
     except Exception as e:
         print(f"Error loading audio with torchaudio: {e}")
 
-def augment_waveform(waveform, sample_rate, shift=0, stretch=1.0):
-    """
-    Apply data augmentation to the waveform.
 
-    Args:
-        waveform (np.ndarray): The audio waveform.
-        sample_rate (int): The sample rate of the audio.
-        shift (int): Number of samples to shift the waveform.
-        stretch (float): Factor by which to stretch the waveform.
+def augment_waveform(waveform, sample_rate, stretch=1.0, shift=0):
+    """ Apply basic data augmentation to the waveform (pitch shift and time stretch). """
+    waveform = waveform.astype(np.float32)
 
-    Returns:
-        np.ndarray: Augmented waveform.
-    """
-    #TODO: Implement data augmentation logic
 
-    return None
+    if stretch != 1.0:
+        waveform = time_stretch(input_audio=waveform, samplerate=float(sample_rate), stretch_factor=float(stretch))
+
+    if shift != 0:
+        pedals = []
+        pedals.append(PitchShift(semitones=shift))
+        board = Pedalboard(pedals)
+        waveform = board(waveform, sample_rate=sample_rate)
+        return waveform
+
+    return waveform
+
 
 def create_spectrogram(
         waveform,

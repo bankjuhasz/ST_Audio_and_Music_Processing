@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from constants import *
 from model import ThreeHeadedDragon
-from postprocessing import postp_minimal, postp_tempo
+from postprocessing import postp_minimal, postp_tempo, madmom_dbn_beats, madmom_onsets
 
 def predict_single_example(checkpoint_path: str, spect_path: str, device: str = 'cpu', target: str = 'beat') -> dict:
     model = load_model(checkpoint_path, device)
@@ -32,15 +32,21 @@ def make_predictions(checkpoint_path, device: str = 'cpu'):
         pred_onsets = output['onset'].squeeze(-1) # remove channel dim
         pred_tempi = output['tempo'].squeeze(0) # remove batch dim
 
-        onsets = postp_minimal(pred_logits=pred_onsets, tolerance=50, inference=True)
-        beats = postp_minimal(pred_logits=pred_beats, tolerance=199, inference=True)
+        onsets_ = postp_minimal(pred_logits=pred_onsets, tolerance=50, inference=True)
+        onset_activations = torch.sigmoid(pred_onsets.squeeze(0)).cpu().numpy()
+        onsets = madmom_onsets(onset_activations)
+        beats_ = postp_minimal(pred_logits=pred_beats, tolerance=199, inference=True)
+        beat_activations = torch.sigmoid(pred_beats.squeeze(0)).cpu().numpy()
+        beats = madmom_dbn_beats(beat_activations, fps=100)
         tempo = postp_tempo(pred_logits=pred_tempi, neighborhood=0.2).tolist()
 
         predictions[stem] = {
-            "onsets": onsets,
-            "beats": beats,
+            "onsets": onsets.tolist(),
+            "beats": beats.tolist(),
             "tempo": tempo
         }
+        print(onsets_)
+        print(onsets)
     return predictions
 
 def load_test_spectrograms(test_path: str = TEST_DATA_PATH):
@@ -67,7 +73,7 @@ def load_model(checkpoint_path: str, device: str, freq_dim=FREQ_DIM, stomach_dim
 
 if __name__ == '__main__':
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_name = '10_beats_onsets_tempi_balanced-loss_plscheduled_e76_frs_tcn.pt'
+    ckpt_name = '12_BOT_b-l_plsched_aug_onset_focus_e105_frs_tcn.pt'
     ckpt_path = Path(CHECKPOINT_PATH) / ckpt_name
     predictions = make_predictions(ckpt_path)
     # save predictions to a json file
