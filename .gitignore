@@ -4,3 +4,4 @@ predictions/
 wandb/
 report.docx
 report.pdf
+main.py
