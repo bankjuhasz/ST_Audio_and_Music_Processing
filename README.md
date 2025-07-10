@@ -18,7 +18,7 @@ by Foscarin et al. (2024).
 <figure>
     <img src="images/model.png"
         alt="Architecture"
-        style="width: 25%; height: auto">
+        width="350"/>
     <figcaption>Modified model architecture from Böck et al. (2019)</figcaption>
 </figure>
 

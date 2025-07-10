@@ -5,3 +5,6 @@ wandb/
 report.docx
 report.pdf
 main.py
+TODO.txt
+.idea/
+__pycache__
