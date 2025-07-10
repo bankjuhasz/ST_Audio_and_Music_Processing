@@ -43,7 +43,7 @@ by Foscarin et al. (2024).
 ## Usage
 
 The training script assumes precomputed spectrograms (and their augmented forms) under `data`. Raw audio files can be 
-processed using `postprocessing.py`. Training can be started by running `training.py`. All hyperparameters must be
+processed using `preprocessing.py`. Training can be started by running `training.py`. All hyperparameters must be
 changed in there, or in `loss.py`, `model.py`, `postprocessing.py`.
 
 Were this a published work, this would obviously be much more tidy. The challenge deadline and the small scale of the 
